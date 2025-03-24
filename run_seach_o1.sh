@@ -1,0 +1,11 @@
+python scripts/run_search_o1.py \
+    --dataset_name bamboogle \
+    --split test \
+    --max_search_limit 5 \
+    --max_turn 10 \
+    --top_k 10 \
+    --max_doc_len 3000 \
+    --use_jina True \
+    --model_path "Qwen/QwQ-32B" \
+    --jina_api_key "xxx" \
+    --bing_subscription_key "xxx"
