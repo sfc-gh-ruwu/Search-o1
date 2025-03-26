@@ -12,13 +12,8 @@ import argparse
 
 from transformers import AutoTokenizer
 from vllm import LLM, SamplingParams
+from .cortex_search import CortexSearch
 
-from bing_search import (
-    bing_web_search, 
-    extract_relevant_info, 
-    fetch_page_content, 
-    extract_snippet_with_context
-)
 from evaluate import (
     run_evaluation, 
     extract_answer
@@ -98,20 +93,6 @@ def parse_args():
         help="Maximum length of each searched document."
     )
 
-    parser.add_argument(
-        '--use_jina',
-        type=bool,
-        default=True,
-        help="Whether to use Jina API for document fetching."
-    )
-
-    parser.add_argument(
-        '--jina_api_key',
-        type=str,
-        default='None',
-        help="Your Jina API Key to Fetch URL Content."
-    )
-
     # Model configuration
     parser.add_argument(
         '--model_path',
@@ -156,22 +137,8 @@ def parse_args():
         help="Maximum number of tokens to generate. If not set, defaults based on the model and dataset."
     )
 
-    # Bing API Configuration
-    parser.add_argument(
-        '--bing_subscription_key',
-        type=str,
-        required=True,
-        help="Bing Search API subscription key."
-    )
-
-    parser.add_argument(
-        '--bing_endpoint',
-        type=str,
-        default="https://api.bing.microsoft.com/v7.0/search",
-        help="Bing Search API endpoint."
-    )
-
     return parser.parse_args()
+
 
 def main():
     args = parse_args()
@@ -190,10 +157,6 @@ def main():
     top_k_sampling = args.top_k_sampling
     repetition_penalty = args.repetition_penalty
     max_tokens = args.max_tokens
-    bing_subscription_key = args.bing_subscription_key
-    bing_endpoint = args.bing_endpoint
-    use_jina = args.use_jina
-    jina_api_key = args.jina_api_key
     
     # Adjust parameters based on dataset
     if dataset_name in ['nq', 'triviaqa', 'hotpotqa', 'musique', 'bamboogle', '2wiki', 'medmcqa', 'pubhealth']:
@@ -203,9 +166,6 @@ def main():
             MAX_TURN = 15
         top_k = 10
         max_doc_len = 3000
-    
-    if args.jina_api_key == 'None':
-        jina_api_key = None
 
     # Set default repetition_penalty if not provided
     if repetition_penalty is None:
@@ -222,6 +182,9 @@ def main():
     print('-----------------------')
     print(f'Using {dataset_name} {split} set.')
     print('-----------------------')
+
+    # wrf: init search service
+    retrieval = CortexSearch(connection_config = "./connection_parameters.json", service_config = "./retrieval_service_parameters.json")
 
     # ---------------------- Caching Mechanism ----------------------
     # Define cache directories and file paths
@@ -537,7 +500,8 @@ def main():
                             print(f"Using cached search results for query: \"{search_query}\"")
                         else:
                             try:
-                                results = bing_web_search(search_query, bing_subscription_key, bing_endpoint, market='en-US', language='en')
+                                # wrf: use cortex search
+                                results = retrieval.get_retrieval(question=search_query, k=5)
                                 search_cache[search_query] = results
                                 print(f"Executed and cached search for query: \"{search_query}\"")
                             except Exception as e:
@@ -545,22 +509,9 @@ def main():
                                 search_cache[search_query] = {}
                                 results = {}
 
-                        # Extract relevant information from Bing search results
-                        relevant_info = extract_relevant_info(results)[:top_k]
+                        # wrf
+                        relevant_info = results
                         seq['relevant_info'] = relevant_info
-
-                        # Extract URLs and snippets
-                        urls_to_fetch = [it['url'] for it in relevant_info]
-                        snippets = {info['url']: info['snippet'] for info in relevant_info if 'snippet' in info}
-
-                        # Filter URLs that are not cached
-                        urls_to_fetch_filtered = [u for u in urls_to_fetch if u not in url_cache]
-                        cached_urls = [u for u in urls_to_fetch if u in url_cache]
-
-                        # Store info for all_urls_to_fetch and url_snippets
-                        for url in urls_to_fetch_filtered:
-                            all_urls_to_fetch.add(url)
-                            url_snippets[url] = snippets.get(url, "")
 
                         all_reasoning_steps = seq['output']
                         all_reasoning_steps = all_reasoning_steps.replace('\n\n', '\n').split("\n")
@@ -612,38 +563,13 @@ def main():
                     seq['finished'] = True
                     print("Sequence marked as complete.")
 
-            # Batch fetch all URLs at once to optimize speed
-            if all_urls_to_fetch:
-                print(f"Fetching {len(all_urls_to_fetch)} URLs...")
-                try:
-                    fetched_contents = fetch_page_content(
-                        list(all_urls_to_fetch),
-                        use_jina=use_jina,
-                        jina_api_key=jina_api_key,
-                        # snippets=url_snippets  # Do not pass snippets when updating url_cache directly
-                    )
-                    print(f"Fetched {len(fetched_contents)} URLs successfully.")
-                except Exception as e:
-                    print(f"Error during batch URL fetching: {e}")
-                    fetched_contents = {url: f"Error fetching URL: {e}" for url in all_urls_to_fetch}
-                # Update cache with fetched contents
-                for url, content in fetched_contents.items():
-                    url_cache[url] = content
 
-            # After fetching, prepare formatted documents for batch processing
+            # wrf format doc
             for relevant_info in batch_relevant_info:
                 formatted_documents = ""
                 for i, doc_info in enumerate(relevant_info):
-                    url = doc_info['url']
-                    raw_context = url_cache.get(url, "")
-                    doc_info['snippet'] = doc_info['snippet'].replace('<b>','').replace('</b>','')            
-                    success, filtered_context = extract_snippet_with_context(raw_context, doc_info['snippet'], context_chars=max_doc_len)
-                    if success:
-                        context = filtered_context
-                    else:
-                        context = raw_context[:max_doc_len*2]
 
-                    doc_info['context'] = context
+                    doc_info['context'] = doc_info
                     formatted_documents += f"**Web Page {i + 1}:**\n"
                     formatted_documents += json.dumps(doc_info, ensure_ascii=False, indent=2) + "\n"
                     
